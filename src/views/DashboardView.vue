@@ -5,8 +5,7 @@
       <p>{{ insight }}</p>
     </div>
     <!-- don't show the hero before data is in, page looked empty /J -->
-    <img v-if="consumptionStore.data" src="../assets/hero.png" class="hero">
-    <h1 v-if="userStore.user">Hej {{ userStore.user.name.split(' ')[0] }}!</h1>
+    <img v-if="consumptionStore.data" src="../assets/hero.webp" class="hero">    <h1 v-if="userStore.user">Hej {{ userStore.user.name.split(' ')[0] }}!</h1>
     <h1 v-else>Hej!</h1>
 
     <div class="stats">
@@ -91,7 +90,7 @@ const showTips = () => {
 </script>
 
 <style scoped>
-.hero { width: 100%; border-radius: 10px; margin-bottom: 18px; }
+.hero { width: 100%; aspect-ratio: 2/1; object-fit: cover; border-radius: 10px; margin-bottom: 18px; }
 .insight { border-left: 4px solid #16a34a; }
 .stats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; }
 .stat-label { font-size: 13px; color: #7c8698; margin-bottom: 6px; }
