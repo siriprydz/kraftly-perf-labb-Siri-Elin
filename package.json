@@ -1,0 +1,38 @@
+{
+  "name": "kraftly-mina-sidor",
+  "version": "0.9.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "api": "node mock-api/server.js",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:api": "node --test \"mock-api/**/*.test.js\"",
+    "e2e:pw": "playwright test",
+    "e2e:cy": "start-server-and-test \"npm run api\" http://localhost:4000/healthz \"npm run dev\" http://localhost:5173 \"cypress run\""
+  },
+  "dependencies": {
+    "chart.js": "^4.4.7",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.3",
+    "lodash": "^4.17.21",
+    "pinia": "^2.3.0",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@pinia/testing": "^0.1.7",
+    "@playwright/test": "^1.62.1",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/user-event": "^14.6.6",
+    "@testing-library/vue": "^8.1.0",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "cypress": "^15.21.1",
+    "jsdom": "^30.0.1",
+    "start-server-and-test": "^3.0.12",
+    "vite": "^6.0.7",
+    "vitest": "^4.1.11"
+  }
+}

@@ -1,0 +1,250 @@
+# Kraftly Mina sidor – CI/CD-pipeline (M2 → M6)
+# PR mot main: quality + build + e2e + imagen byggs (men publiceras inte).
+# Push till main: allt ovan → imagen pushas till GHCR taggad med sha → deploy till staging
+#                 → godkännande (miljön production) → SAMMA image deployas till produktion.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Minsta möjliga rättigheter för GITHUB_TOKEN – pipelinen behöver bara läsa repot.
+permissions:
+  contents: read
+
+# Ny push till samma PR avbryter den pågående körningen – sparar minuter i kön.
+# Men bara på PR:er: en körning på main kan vara mitt i en deploy och får aldrig avbrytas.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Vi kör Playwright i CI – ladda inte ner Cypress-binären (~250 MB) i onödan.
+  # Cypress-team: ta bort raden och byt e2e-jobbet enligt kommentaren längst ner.
+  CYPRESS_INSTALL_BINARY: 0
+
+jobs:
+  quality:
+    name: Lint & enhetstester
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm            # cachar ~/.npm nycklat på package-lock.json
+      - run: npm ci
+      # I teamets repo finns lint och format:check sedan M1 – de hör hemma här:
+      # - run: npm run lint
+      # - run: npm run format:check
+      - run: npm run test:run
+      - run: npm run test:api
+      # Beroenden med kända sårbarheter (OWASP A03). Varnar, blockerar inte – se docs/pipeline.md.
+      - run: npm audit --omit=dev --audit-level=high || echo "::warning::npm audit hittade sårbarheter i produktionsberoenden – se loggen"
+
+  build:
+    name: Bygg
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
+          retention-days: 7
+
+  e2e:
+    name: E2E-smoke (Playwright)
+    runs-on: ubuntu-latest
+    needs: build              # testar den byggda artefakten – inte källkoden en gång till
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - run: npx playwright install --with-deps chromium
+      - run: npm run e2e:pw
+        env:
+          E2E_SERVER: preview   # playwright.config.js: vite preview på dist/ istället för dev-servern
+          # Nyckel till mock-API:t som startas här på runnern. Ingen hemlighet – den öppnar
+          # bara ett API som lever i två minuter på en maskin som sedan slängs.
+          API_KEY: e2e-testnyckel
+          JWT_SECRET: e2e-hemlighet-som-bara-lever-i-den-har-korningen
+      - uses: actions/upload-artifact@v4
+        if: failure()          # rapporten med skärmdumpar är bara intressant när det gick fel
+        with:
+          name: playwright-report
+          path: playwright-report
+
+  publish:
+    name: Image → GHCR
+    runs-on: ubuntu-latest
+    needs: [quality, e2e] # bara kod som klarat testerna blir en image
+    permissions:
+      contents: read
+      packages: write # får pusha till GitHub Container Registry
+    steps:
+      - uses: actions/checkout@v4
+      # GHCR kräver små bokstäver – repot kan heta Team-Volt/Kraftly. ${VAR,,} = gemener i bash.
+      - name: Imagenamn
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      # Bygg EN gång, tagga med sha. Det är den här imagen – inte källkoden – som deployas.
+      - name: Bygg imagen
+        run: docker build --build-arg GIT_SHA=${{ github.sha }} -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:main" .
+      - run: docker image ls "$IMAGE" --format "{{.Repository}}:{{.Tag}}  {{.Size}}"
+      - name: Logga in på GHCR
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pusha
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:main"
+
+  deploy-staging:
+    name: Deploy → staging
+    runs-on: ubuntu-latest
+    needs: publish
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    # Secret RENDER_DEPLOY_HOOK + variabel STAGING_URL ligger i GitHub-miljön "staging"
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false # avbryt aldrig en deploy halvvägs
+    steps:
+      - name: Be Render köra exakt den här imagen
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          : "${HOOK:?RENDER_DEPLOY_HOOK saknas i miljön staging}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
+          ENCODED=$(jq -rn --arg u "$IMAGE" '$u|@uri') # ghcr.io/a/b:sha → ghcr.io%2Fa%2Fb%3Asha
+          curl -fsS -X POST "${HOOK}&imgURL=${ENCODED}"
+          echo
+          echo "Render har tagit emot $IMAGE"
+      - name: Vänta tills staging kör den här committen
+        env:
+          URL: ${{ vars.STAGING_URL }}
+        run: |
+          : "${URL:?STAGING_URL saknas i miljön staging}"
+          URL="${URL%/}"
+          for i in $(seq 1 30); do
+            LIVE=$(curl -fsS "$URL/version.txt" 2>/dev/null || true)
+            if [ "$LIVE" = "$GITHUB_SHA" ]; then
+              echo "✅ $URL kör $GITHUB_SHA"
+              exit 0
+            fi
+            echo "Försök $i/30: staging kör ${LIVE:-(inget svar ännu)} – väntar 10 s"
+            sleep 10
+          done
+          echo "::error::Staging kör fortfarande inte $GITHUB_SHA efter 5 minuter. Kolla Events/Logs i Render."
+          exit 1
+      - name: Röktest mot staging – svarar API v2 och sitter säkerhetsheaders på?
+        env:
+          URL: ${{ vars.STAGING_URL }}
+        run: |
+          URL="${URL%/}"
+          # Fel lösenord ska ge 401 – inte 500, inte 200. Det bevisar att v2 svarar genom proxyn.
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$URL/api/v2/auth/login" -H 'Content-Type: application/json' -d '{"email":"a@b.se","password":"x"}')
+          [ "$CODE" = "401" ] || { echo "::error::Väntade 401 från /api/v2/auth/login, fick $CODE"; exit 1; }
+          curl -fsSI "$URL/" | grep -i '^content-security-policy:' || { echo "::error::CSP-headern saknas"; exit 1; }
+          echo "✅ API v2 svarar via nginx och CSP är på"
+
+  deploy-production:
+    name: Deploy → produktion
+    runs-on: ubuntu-latest
+    needs: deploy-staging # exakt den sha som staging just verifierade – ingen ny build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    # Miljön "production" har en required reviewer (Settings → Environments → production → Required reviewers).
+    # Jobbet väntar tills någon i teamet godkänner under Actions → körningen → "Review deployments".
+    # Med reviewern: Continuous Delivery. Utan: Continuous Deployment. Det är hela skillnaden.
+    environment:
+      name: production
+      url: ${{ vars.PROD_URL }}
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - name: Be Render köra exakt den här imagen i produktion
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }} # samma namn som i staging, men miljön production har sitt eget värde
+        run: |
+          : "${HOOK:?RENDER_DEPLOY_HOOK saknas i miljön production}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
+          ENCODED=$(jq -rn --arg u "$IMAGE" '$u|@uri')
+          curl -fsS -X POST "${HOOK}&imgURL=${ENCODED}"
+          echo
+          echo "Render har tagit emot $IMAGE (produktion)"
+      - name: Vänta tills produktion kör den här committen
+        env:
+          URL: ${{ vars.PROD_URL }}
+        run: |
+          : "${URL:?PROD_URL saknas i miljön production}"
+          URL="${URL%/}"
+          for i in $(seq 1 30); do
+            LIVE=$(curl -fsS "$URL/version.txt" 2>/dev/null || true)
+            if [ "$LIVE" = "$GITHUB_SHA" ]; then
+              echo "✅ $URL kör $GITHUB_SHA"
+              exit 0
+            fi
+            echo "Försök $i/30: produktion kör ${LIVE:-(inget svar ännu)} – väntar 10 s"
+            sleep 10
+          done
+          echo "::error::Produktion kör fortfarande inte $GITHUB_SHA efter 5 minuter. Kolla Events/Logs i Render."
+          exit 1
+      - name: Röktest mot produktion – inloggning genom proxyn, och flaggan av
+        env:
+          URL: ${{ vars.PROD_URL }}
+        run: |
+          URL="${URL%/}"
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$URL/api/v2/auth/login" -H 'Content-Type: application/json' -d '{"email":"a@b.se","password":"x"}')
+          [ "$CODE" = "401" ] || { echo "::error::Väntade 401 från /api/v2/auth/login, fick $CODE"; exit 1; }
+          curl -fsSI "$URL/" | grep -i '^content-security-policy:' || { echo "::error::CSP-headern saknas"; exit 1; }
+          if curl -fsS "$URL/config.js" | grep -q "norway: false"; then
+            echo "✅ API v2 svarar, CSP är på och FEATURE_NORWAY är av i produktion"
+          else
+            echo "::error::Norge-flaggan är PÅ i produktion – kontrollera FEATURE_NORWAY i Render"
+            exit 1
+          fi
+
+  # ---- Cypress-variant av e2e-jobbet (för team som valde Cypress) ----
+  # e2e:
+  #   name: E2E-smoke (Cypress)
+  #   runs-on: ubuntu-latest
+  #   needs: build
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-node@v4
+  #       with:
+  #         node-version: 22
+  #         cache: npm
+  #     - run: npm ci                 # laddar ner Cypress-binären – ta bort CYPRESS_INSTALL_BINARY ovan
+  #     - run: npm run e2e:cy         # start-server-and-test startar api + dev, kör cypress run
+  #       env:
+  #         API_KEY: e2e-testnyckel     # mock-API:t vägrar starta utan nyckel (M4)
+  #         JWT_SECRET: e2e-hemlighet-som-bara-lever-i-den-har-korningen
+  #     - uses: actions/upload-artifact@v4
+  #       if: failure()
+  #       with:
+  #         name: cypress-screenshots
+  #         path: cypress/screenshots

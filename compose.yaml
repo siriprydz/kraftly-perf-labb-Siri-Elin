@@ -1,0 +1,23 @@
+# docker compose up --build  →  http://localhost:8080
+# Kräver en .env bredvid den här filen (cp .env.example .env). Compose läser den själv.
+services:
+  web:
+    build: .
+    ports:
+      - "8080:80"
+    environment:
+      API_URL: http://api:4000
+      API_KEY: ${API_KEY:?API_KEY saknas – kör cp .env.example .env}
+    depends_on:
+      - api
+
+  api:
+    build:
+      context: .
+      dockerfile: mock-api/Dockerfile
+    environment:
+      API_KEY: ${API_KEY:?API_KEY saknas – kör cp .env.example .env}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET saknas – kör cp .env.example .env}
+      # Cookien får Secure först bakom https (staging/prod). Lokalt: http.
+      COOKIE_SECURE: "false"
+    # Ingen publicerad port: bara web når api, via nätverket. Browsern pratar med web.

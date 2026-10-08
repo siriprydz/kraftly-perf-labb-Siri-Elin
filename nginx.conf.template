@@ -1,0 +1,53 @@
+# MALL – nginx-imagen fyller i ${PORT}, ${API_URL} och ${API_KEY} från miljön när
+# containern startar och skriver resultatet till /etc/nginx/conf.d/default.conf.
+# Saknas en variabel vägrar nginx starta: [emerg] unknown "api_key" variable.
+server {
+  listen ${PORT};
+  root /usr/share/nginx/html;
+  index index.html;
+
+  # Säkerhetsheaders (CSP m.fl.) – se docker/security-headers.conf. Inkluderas igen i varje
+  # location som har egna add_header-rader, annars försvinner de där.
+  include /etc/nginx/security-headers.conf;
+  server_tokens off;
+
+  # Single page-app: okända adresser (/fakturor, /profil …) ska ge index.html
+  # så att Vue Router kan ta över. Utan den här raden: 404 vid omladdning.
+  location / {
+    try_files $uri $uri/ /index.html;
+  }
+
+  # --- Cache-headers -------------------------------------------------------
+  # Vite döper byggda filer efter innehållet: /assets/index-3f9c2e1a.js. Ändras
+  # innehållet byts namnet, så filen kan cachas i ett år utan att någon ser
+  # gammal kod. "immutable" säger åt browsern att inte ens fråga om den ändrats.
+  location /assets/ {
+    include /etc/nginx/security-headers.conf;
+    add_header Cache-Control "public, max-age=31536000, immutable";
+  }
+
+  # Ingångarna får ALDRIG fastna i cache: det är de som pekar på de hashade filerna.
+  # no-cache = spara gärna, men fråga servern innan du använder kopian (ETag/304).
+  # index.html: annars ser användaren gamla filnamn efter en deploy.
+  # config.js:  annars slår en flagga inte igenom förrän cachen går ut.
+  # version.txt: annars ljuger den för pipelinen och för er själva.
+  location = /index.html { include /etc/nginx/security-headers.conf; add_header Cache-Control "no-cache"; }
+  location = /config.js  { include /etc/nginx/security-headers.conf; add_header Cache-Control "no-cache"; }
+  location = /version.txt { include /etc/nginx/security-headers.conf; add_header Cache-Control "no-cache"; }
+
+  # Appen anropar /api relativt. Här skickas anropet vidare – lokalt till api-containern
+  # (API_URL=http://api:4000), i staging till Kraftlys test-API – och nyckeln läggs på
+  # på servern. Browsern ser aldrig nyckeln.
+  location /api/ {
+    proxy_pass ${API_URL}/api/;
+    proxy_set_header X-Api-Key ${API_KEY};
+    # API-svar ska aldrig cachas – de är personliga
+    add_header Cache-Control "no-store" always;
+    include /etc/nginx/security-headers.conf;
+    # Vad browsern skickade som origin och protokoll – så att API:t kan sätta Secure-cookies rätt
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_ssl_server_name on;   # krävs när API_URL är https (SNI)
+    proxy_read_timeout 90s;     # test-API:t på gratisnivå kan sova – första anropet tar upp mot en minut
+  }
+}
